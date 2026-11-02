@@ -41,6 +41,8 @@ unless the user forces one or the other.
 import io
 import itertools
 import html as _html
+import json
+import streamlit.components.v1 as components
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -545,6 +547,46 @@ def render_table_markdown(header, display_rows, group_col, alpha):
         html += "</tr>"
     html += "</tbody></table>"
     return html
+
+
+def copy_table_buttons(table_html, csv_rows):
+    """Render two buttons that copy the table to the clipboard:
+    (1) formatted table  -> paste into Word / Google Docs / Excel / PowerPoint
+    (2) tab-separated text -> paste into Excel / Sheets / any text editor
+    Uses a click-triggered selection + execCommand('copy'), which works inside
+    Streamlit's component iframe without extra browser permissions."""
+    tsv = "\n".join("\t".join("" if c is None else str(c) for c in r) for r in csv_rows)
+    page = """
+    <div style="font-family:Arial,sans-serif;">
+      <button id="b1" style="padding:8px 16px;margin-right:8px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:14px;">
+        \U0001F4CB Copy table (formatted)</button>
+      <button id="b2" style="padding:8px 16px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;font-size:14px;">
+        \U0001F4C4 Copy as plain text (tab-separated)</button>
+      <span id="msg" style="margin-left:12px;font-size:13px;color:#2e7d32;"></span>
+      <div id="src" style="position:absolute;left:-99999px;top:0;background:#fff;">__HTML__</div>
+      <textarea id="ta" style="position:absolute;left:-99999px;top:0;"></textarea>
+    </div>
+    <script>
+      const TSV = __TSV__;
+      const msg = document.getElementById('msg');
+      function done(t){ msg.textContent = t; setTimeout(()=>msg.textContent='', 2500); }
+      document.getElementById('b1').onclick = function(){
+        const src = document.getElementById('src');
+        const range = document.createRange(); range.selectNodeContents(src);
+        const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+        let ok = false; try { ok = document.execCommand('copy'); } catch(e) {}
+        sel.removeAllRanges();
+        done(ok ? 'Copied! Paste into Word / Excel.' : 'Copy blocked by browser \u2014 use the download buttons.');
+      };
+      document.getElementById('b2').onclick = function(){
+        const ta = document.getElementById('ta'); ta.value = TSV; ta.select();
+        let ok = false; try { ok = document.execCommand('copy'); } catch(e) {}
+        done(ok ? 'Copied as plain text!' : 'Copy blocked by browser \u2014 use the download buttons.');
+      };
+    </script>
+    """
+    page = page.replace("__HTML__", table_html).replace("__TSV__", json.dumps(tsv))
+    components.html(page, height=60)
 
 
 def _set_cell_border(cell, **kwargs):
@@ -1565,11 +1607,11 @@ if uploaded is not None:
 
         st.markdown(f"### {res['title']}")
         if res["layout"] == "custom":
-            st.markdown(render_custom_html(res["custom"]["hdr"], res["custom"]["rows"], result_alpha),
-                         unsafe_allow_html=True)
+            table_html = render_custom_html(res["custom"]["hdr"], res["custom"]["rows"], result_alpha)
         else:
-            st.markdown(render_table_markdown(header, display_rows, result_group_col, result_alpha),
-                         unsafe_allow_html=True)
+            table_html = render_table_markdown(header, display_rows, result_group_col, result_alpha)
+        st.markdown(table_html, unsafe_allow_html=True)
+        copy_table_buttons(table_html, csv_rows)
 
         if res["layout"] in ("factors", "custom"):
             footnotes = res["footnotes"]
