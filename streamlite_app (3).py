@@ -39,6 +39,12 @@ Two table layouts
    signed-rank test (non-parametric). In "auto" mode normality is assessed on
    the paired differences, which is the assumption the paired t-test makes.
 
+5. ANOVA: one or more numeric outcomes x one or more categorical grouping
+   variables. Gives a summary table, an ANOVA table (SS, df, MS, F/H, p),
+   assumption checks (Shapiro-Wilk, Levene) and post-hoc pairwise comparisons
+   (Tukey HSD / Games-Howell / Bonferroni, or Mann-Whitney with Holm /
+   Bonferroni / BH after Kruskal-Wallis).
+
 Parametric vs non-parametric is decided automatically via the
 D'Agostino-Pearson omnibus normality test (scipy.stats.normaltest),
 unless the user forces one or the other.
@@ -48,11 +54,13 @@ import io
 import itertools
 import html as _html
 import json
+import re
 import streamlit.components.v1 as components
 import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy import stats
+from scipy.stats import studentized_range
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.section import WD_ORIENT
@@ -595,6 +603,531 @@ def paired_footnotes(display_mode, alpha, pre_col, post_col, test_mode, flags, n
                      "non-zero differences) and was left blank.")
     notes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
     return notes
+
+
+# --------------------------------------------------------------------------
+# ANOVA layout (one-way ANOVA / Welch / Kruskal-Wallis + post hoc)
+# --------------------------------------------------------------------------
+
+P_COLS = {"p-value", "p (raw)", "p (adj.)"}
+
+
+def an_fmt_num(x, d=2):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "\u2014"
+    return f"{x:.{d}f}"
+
+
+def fmt_df(x):
+    if x is None:
+        return "—"
+    return f"{x:.0f}" if float(x).is_integer() else f"{x:.1f}"
+
+
+def is_sig(s, alpha):
+    s = str(s)
+    if s.startswith("<"):
+        return True
+    try:
+        return float(s) < alpha
+    except ValueError:
+        return False
+
+
+def padjust(p, method):
+    p = np.asarray(p, float)
+    m = len(p)
+    if method == "none" or m <= 1:
+        return p.copy()
+    if method == "bonferroni":
+        return np.minimum(1, p * m)
+    order = np.argsort(p)
+    adj = np.empty(m)
+    if method == "holm":
+        running = 0.0
+        for rank, i in enumerate(order):
+            running = max(running, (m - rank) * p[i])
+            adj[i] = min(1.0, running)
+        return adj
+    if method == "bh":
+        running = 1.0
+        for rank in range(m - 1, -1, -1):
+            i = order[rank]
+            running = min(running, p[i] * m / (rank + 1))
+            adj[i] = running
+        return adj
+    raise ValueError(method)
+
+
+def normality_test(arr):
+    """Shapiro-Wilk (n<=5000) or D'Agostino-Pearson (n>5000). Returns (stat, p)
+    or (None, None) when it cannot be computed (n<3 or constant data)."""
+    arr = np.asarray(arr, float)
+    if len(arr) < 3 or np.ptp(arr) == 0:
+        return None, None
+    try:
+        if len(arr) > 5000:
+            s, p = stats.normaltest(arr)
+        else:
+            s, p = stats.shapiro(arr)
+        return float(s), float(p)
+    except Exception:
+        return None, None
+
+
+def eta_squared(groups):
+    allv = np.concatenate(groups)
+    gm = allv.mean()
+    ssb = sum(len(g) * (g.mean() - gm) ** 2 for g in groups)
+    sst = ((allv - gm) ** 2).sum()
+    return float(ssb / sst) if sst > 0 else np.nan
+
+
+def _tbl(source, ss=None, df=None, ms=None, stat=None, p=None):
+    return {"Source": source, "ss": ss, "df": df, "ms": ms, "stat": stat, "p": p}
+
+
+def classic_anova(groups):
+    res = stats.f_oneway(*groups)
+    k, N = len(groups), sum(len(g) for g in groups)
+    allv = np.concatenate(groups)
+    gm = allv.mean()
+    ssb = sum(len(g) * (g.mean() - gm) ** 2 for g in groups)
+    ssw = sum(((g - g.mean()) ** 2).sum() for g in groups)
+    dfb, dfw = k - 1, N - k
+    table = [
+        _tbl("Between groups", ssb, dfb, ssb / dfb, float(res.statistic), float(res.pvalue)),
+        _tbl("Within groups", ssw, dfw, ssw / dfw),
+        _tbl("Total", ssb + ssw, N - 1),
+    ]
+    return {"name": "One-way ANOVA", "stat": f"F={res.statistic:.2f}, df={k-1},{N-k}",
+            "p": float(res.pvalue), "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}", "table": table}
+
+
+def welch_anova(groups):
+    k = len(groups)
+    n = np.array([len(g) for g in groups], float)
+    m = np.array([g.mean() for g in groups])
+    v = np.array([g.var(ddof=1) for g in groups])
+    w = n / v
+    W = w.sum()
+    mw = (w * m).sum() / W
+    a = (w * (m - mw) ** 2).sum() / (k - 1)
+    t = (((1 - w / W) ** 2) / (n - 1)).sum()
+    b = 1 + 2 * (k - 2) / (k ** 2 - 1) * t
+    F = a / b
+    df2 = (k ** 2 - 1) / (3 * t)
+    p = float(stats.f.sf(F, k - 1, df2))
+    table = [_tbl("Between groups", None, k - 1, None, float(F), p),
+             _tbl("Within groups", None, float(df2))]
+    return {"name": "Welch's ANOVA", "stat": f"F={F:.2f}, df={k-1},{df2:.1f}",
+            "p": p, "effect": f"\u03B7\u00B2={eta_squared(groups):.3f}", "table": table}
+
+
+def kruskal(groups):
+    res = stats.kruskal(*groups)
+    N = sum(len(g) for g in groups)
+    eps = res.statistic / (N - 1) if N > 1 else np.nan
+    table = [_tbl("Between groups", None, len(groups) - 1, None, float(res.statistic), float(res.pvalue)),
+             _tbl("Total", None, N - 1)]
+    return {"name": "Kruskal\u2013Wallis H", "stat": f"H={res.statistic:.2f}, df={len(groups)-1}",
+            "p": float(res.pvalue), "effect": f"\u03B5\u00B2={eps:.3f}", "table": table}
+
+
+def posthoc_parametric(names, groups, method, alpha, d):
+    """method: 'tukey' | 'gameshowell' | 'bonferroni'. Returns list of row dicts."""
+    k = len(groups)
+    n = np.array([len(g) for g in groups], float)
+    m = np.array([g.mean() for g in groups])
+    v = np.array([g.var(ddof=1) for g in groups])
+    N = n.sum()
+    dfw = N - k
+    mse = ((n - 1) * v).sum() / dfw
+    pairs = list(itertools.combinations(range(k), 2))
+    npairs = len(pairs)
+    rows = []
+    for i, j in pairs:
+        diff = m[i] - m[j]
+        if method == "tukey":
+            se = np.sqrt(mse / 2 * (1 / n[i] + 1 / n[j]))
+            q = abs(diff) / se if se > 0 else np.nan
+            p = float(studentized_range.sf(q, k, dfw))
+            crit = studentized_range.ppf(1 - alpha, k, dfw)
+            lo, hi = diff - crit * se, diff + crit * se
+            stat = f"q={q:.2f}, df={dfw:.0f}"
+            label = "Tukey HSD"
+        elif method == "gameshowell":
+            s2 = v[i] / n[i] + v[j] / n[j]
+            se = np.sqrt(s2 / 2)
+            df = s2 ** 2 / ((v[i] / n[i]) ** 2 / (n[i] - 1) + (v[j] / n[j]) ** 2 / (n[j] - 1))
+            q = abs(diff) / se if se > 0 else np.nan
+            p = float(studentized_range.sf(q, k, df))
+            crit = studentized_range.ppf(1 - alpha, k, df)
+            lo, hi = diff - crit * se, diff + crit * se
+            stat = f"q={q:.2f}, df={df:.1f}"
+            label = "Games-Howell"
+        else:  # bonferroni pooled-variance t-tests
+            se = np.sqrt(mse * (1 / n[i] + 1 / n[j]))
+            t = diff / se if se > 0 else np.nan
+            p_raw = 2 * stats.t.sf(abs(t), dfw)
+            p = float(min(1.0, p_raw * npairs))
+            crit = stats.t.ppf(1 - alpha / (2 * npairs), dfw)
+            lo, hi = diff - crit * se, diff + crit * se
+            stat = f"t={t:.2f}, df={dfw:.0f}"
+            label = "Bonferroni t-test"
+        rows.append({"Comparison": f"{names[i]} \u2212 {names[j]}", "Method": label,
+                     "Difference": an_fmt_num(diff, d), "CI": f"{an_fmt_num(lo, d)} to {an_fmt_num(hi, d)}",
+                     "Statistic": stat, "p (raw)": "—", "p (adj.)": fmt_p(p), "_p": p})
+    return rows
+
+
+def hodges_lehmann(a, b, alpha):
+    """Median of all pairwise differences a-b with a distribution-free CI
+    (normal approximation to the Mann-Whitney U distribution)."""
+    diffs = np.sort((a[:, None] - b[None, :]).ravel())
+    n1n2 = len(diffs)
+    est = float(np.median(diffs))
+    z = stats.norm.ppf(1 - alpha / 2)
+    c = n1n2 / 2 - z * np.sqrt(n1n2 * (len(a) + len(b) + 1) / 12)
+    c = int(np.floor(c))
+    lo = diffs[max(c, 0)]
+    hi = diffs[min(n1n2 - 1 - c, n1n2 - 1)] if c >= 0 else diffs[-1]
+    return est, float(lo), float(hi)
+
+
+def posthoc_nonparametric(names, groups, padj, alpha, d):
+    k = len(groups)
+    pairs = list(itertools.combinations(range(k), 2))
+    npairs = len(pairs)
+    # CI is Bonferroni-widened whenever a familywise correction (Holm/Bonferroni) is chosen
+    ci_alpha = alpha / npairs if padj in ("bonferroni", "holm") else alpha
+    raw, parts = [], []
+    for i, j in pairs:
+        a, b = groups[i], groups[j]
+        res = stats.mannwhitneyu(a, b, alternative="two-sided")
+        est, lo, hi = hodges_lehmann(a, b, ci_alpha)
+        raw.append(float(res.pvalue))
+        parts.append((i, j, res.statistic, est, lo, hi))
+    adj = padjust(raw, padj)
+    label = {"holm": "Mann-Whitney (Holm)", "bonferroni": "Mann-Whitney (Bonferroni)",
+             "bh": "Mann-Whitney (BH)", "none": "Mann-Whitney (unadjusted)"}[padj]
+    rows = []
+    for (i, j, U, est, lo, hi), pr, pa in zip(parts, raw, adj):
+        rows.append({"Comparison": f"{names[i]} \u2212 {names[j]}", "Method": label,
+                     "Difference": an_fmt_num(est, d), "CI": f"{an_fmt_num(lo, d)} to {an_fmt_num(hi, d)}",
+                     "Statistic": f"U={U:.1f}", "p (raw)": fmt_p(pr),
+                     "p (adj.)": fmt_p(float(pa)), "_p": float(pa)})
+    return rows
+
+
+def get_groups(df, outcome, gcol):
+    sub = pd.DataFrame({
+        "y": pd.to_numeric(df[outcome], errors="coerce"),
+        "g": df[gcol].astype(str).str.strip(),
+    })
+    sub = sub.dropna()
+    sub = sub[~sub["g"].isin(["", "nan", "NaN", "None"])]
+    out = {}
+    dropped = []
+    for lvl, grp in sub.groupby("g"):
+        if len(grp) >= 2:
+            out[lvl] = grp["y"].to_numpy(float)
+        else:
+            dropped.append(lvl)
+    return out, dropped
+
+
+def summary_cell(values, mode, use_param, d):
+    parts = []
+    if mode in ("mean_sd", "both") or (mode == "auto" and use_param):
+        parts.append(f"{an_fmt_num(np.mean(values), d)} \u00B1 {an_fmt_num(np.std(values, ddof=1), d)}")
+    if mode in ("median_iqr", "both") or (mode == "auto" and not use_param):
+        q1, med, q3 = np.percentile(values, [25, 50, 75])
+        parts.append(f"{an_fmt_num(med, d)} ({an_fmt_num(q1, d)}\u2013{an_fmt_num(q3, d)})")
+    return "; ".join(parts)
+
+
+def outcome_label(col, mode, use_param):
+    if mode == "mean_sd" or (mode == "auto" and use_param):
+        return f"{col}, mean \u00B1 SD"
+    if mode == "median_iqr" or (mode == "auto" and not use_param):
+        return f"{col}, median (IQR)"
+    return f"{col}, mean \u00B1 SD; median (IQR)"
+
+
+def analyze_anova(df, outcome, gcol, cfg):
+    """Returns dict(summary_cells, test, assumptions, posthoc, anova, use_param, msg) or None + message."""
+    alpha, d = cfg["alpha"], cfg["decimals"]
+    groups, dropped = get_groups(df, outcome, gcol)
+    if len(groups) < 2:
+        return None, f"{outcome} by {gcol}: fewer than 2 groups with n\u22652 \u2014 skipped."
+    names = sorted(groups)
+    arrs = [groups[nm] for nm in names]
+    k = len(arrs)
+
+    assumptions, normal_flags = [], []
+    for nm, a in zip(names, arrs):
+        W, p = normality_test(a)
+        ok = (p is not None) and p > alpha
+        normal_flags.append(ok)
+        assumptions.append({
+            "Outcome": outcome, "Check": "Normality (Shapiro-Wilk)" if len(a) <= 5000 else "Normality (D'Agostino-Pearson)",
+            "Group": nm, "n": len(a), "Statistic": "—" if W is None else f"{W:.3f}",
+            "p-value": fmt_p(p), "Result": "Normal" if ok else ("Not normal" if p is not None else "n/a (n<3 or constant)"),
+        })
+    try:
+        lev_stat, lev_p = stats.levene(*arrs, center="median")
+        lev_p = float(lev_p)
+        eq_var = lev_p > alpha
+        assumptions.append({
+            "Outcome": outcome, "Check": "Equal variances (Levene, median-centred)", "Group": "All groups",
+            "n": sum(len(a) for a in arrs), "Statistic": f"W={lev_stat:.3f}", "p-value": fmt_p(lev_p),
+            "Result": "Equal" if eq_var else "Unequal",
+        })
+    except Exception:
+        lev_p, eq_var = np.nan, True
+
+    if cfg["test_mode"] == "parametric":
+        use_param = True
+    elif cfg["test_mode"] == "nonparametric":
+        use_param = False
+    else:
+        use_param = all(normal_flags)
+
+    try:
+        if use_param:
+            welch = cfg["variance"] == "welch" or (cfg["variance"] == "auto" and not eq_var)
+            if welch and min(a.var(ddof=1) for a in arrs) == 0:
+                welch = False  # Welch needs non-zero variance in every group
+            test = welch_anova(arrs) if welch else classic_anova(arrs)
+        else:
+            welch = False
+            test = kruskal(arrs)
+    except Exception as e:
+        return None, f"{outcome} by {gcol}: test could not be computed ({e})."
+
+    posthoc = []
+    if k >= 3 and (not cfg["posthoc_only_sig"] or test["p"] < alpha):
+        try:
+            if use_param:
+                m = cfg["posthoc_param"]
+                if m == "auto":
+                    m = "gameshowell" if welch else "tukey"
+                posthoc = posthoc_parametric(names, arrs, m, alpha, d)
+            else:
+                posthoc = posthoc_nonparametric(names, arrs, cfg["posthoc_np"], alpha, d)
+        except Exception as e:
+            return None, f"{outcome} by {gcol}: post-hoc failed ({e})."
+        for r in posthoc:
+            r["Outcome"] = outcome
+
+    # ANOVA table rows
+    stat_col = "H" if test["name"].startswith("Kruskal") else "F"
+    anova_rows = []
+    for r in test["table"]:
+        anova_rows.append({
+            "Outcome": outcome, "Test": test["name"], "Source": r["Source"],
+            "SS": an_fmt_num(r["ss"], d), "df": fmt_df(r["df"]), "MS": an_fmt_num(r["ms"], d),
+            "F / H": "—" if r["stat"] is None else f"{stat_col}={an_fmt_num(r['stat'], d)}",
+            "p-value": fmt_p(r["p"]),
+        })
+
+    cells = {nm: summary_cell(a, cfg["display"], use_param, d) for nm, a in zip(names, arrs)}
+    notes = []
+    if dropped:
+        notes.append(f"{outcome} by {gcol}: groups with n<2 excluded ({', '.join(dropped)}).")
+    return {"cells": cells, "test": test, "assumptions": assumptions, "posthoc": posthoc,
+            "anova": anova_rows, "use_param": use_param, "k": k,
+            "label": outcome_label(outcome, cfg["display"], use_param)}, notes
+
+
+def render_html_anova(df, alpha):
+    css = ("<style>.sl-t{border-collapse:collapse;width:100%;font-size:0.9rem;"
+           "border-top:2px solid currentColor;border-bottom:2px solid currentColor}"
+           ".sl-t th{border-bottom:1px solid currentColor;text-align:left;padding:4px 8px}"
+           ".sl-t td{padding:4px 8px}</style>")
+    head = "".join(f"<th>{_html.escape(str(c))}</th>" for c in df.columns)
+    body = ""
+    for _, row in df.iterrows():
+        tds = ""
+        for c in df.columns:
+            v = _html.escape(str(row[c]))
+            if c in P_COLS and is_sig(row[c], alpha):
+                v = f"<b>{v}</b>"
+            tds += f"<td>{v}</td>"
+        body += f"<tr>{tds}</tr>"
+    return f"{css}<table class='sl-t'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def build_excel_anova(results):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for i, (g, r) in enumerate(results.items(), 1):
+            tag = re.sub(r"[\[\]:*?/\\]", "_", g)[:22]
+            r["summary"].to_excel(xw, sheet_name=f"S{i}_{tag}"[:31], index=False)
+            r["anova"].to_excel(xw, sheet_name=f"T{i}_{tag}"[:31], index=False)
+            r["assumptions"].to_excel(xw, sheet_name=f"A{i}_{tag}"[:31], index=False)
+            if not r["posthoc"].empty:
+                r["posthoc"].to_excel(xw, sheet_name=f"P{i}_{tag}"[:31], index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _docx_table(doc, df, alpha):
+    t = doc.add_table(rows=1, cols=len(df.columns))
+    t.style = "Table Grid"
+    for i, c in enumerate(df.columns):
+        t.rows[0].cells[i].text = str(c)
+        for run in t.rows[0].cells[i].paragraphs[0].runs:
+            run.bold = True
+            run.font.size = Pt(8)
+    for _, row in df.iterrows():
+        cells = t.add_row().cells
+        for i, c in enumerate(df.columns):
+            cells[i].text = str(row[c])
+            for p in cells[i].paragraphs:
+                if i > 0:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in p.runs:
+                    run.font.size = Pt(8)
+                    if c in P_COLS and is_sig(row[c], alpha):
+                        run.bold = True
+
+
+def build_docx_anova(results, alpha, footnotes):
+    doc = Document()
+    sec = doc.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = sec.page_height, sec.page_width
+    for g, r in results.items():
+        doc.add_heading(f"Comparison by {g}", level=2)
+        doc.add_paragraph("Summary").runs[0].bold = True
+        _docx_table(doc, r["summary"], alpha)
+        doc.add_paragraph()
+        doc.add_paragraph("ANOVA table").runs[0].bold = True
+        _docx_table(doc, r["anova"], alpha)
+        if not r["posthoc"].empty:
+            doc.add_paragraph()
+            doc.add_paragraph("Post-hoc pairwise comparisons").runs[0].bold = True
+            _docx_table(doc, r["posthoc"], alpha)
+        doc.add_paragraph()
+        doc.add_paragraph("Assumption checks").runs[0].bold = True
+        _docx_table(doc, r["assumptions"], alpha)
+    doc.add_paragraph()
+    for f in footnotes:
+        p = doc.add_paragraph(f)
+        for run in p.runs:
+            run.italic = True
+            run.font.size = Pt(8)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+def run_anova_analysis(df, outcomes, group_cols, cfg):
+    """Runs analyze_anova for every outcome x grouping variable.
+    Returns (results, messages, flags); results[group] holds the summary,
+    ANOVA, assumption and post-hoc DataFrames."""
+    alpha = cfg["alpha"]
+    results, messages, flags = {}, [], set()
+    for g in group_cols:
+        all_levels = sorted(df[g].dropna().astype(str).str.strip().unique())
+        all_levels = [x for x in all_levels if x not in ("", "nan")]
+        s_rows, a_rows, p_rows, t_rows = [], [], [], []
+        for o in outcomes:
+            res, note = analyze_anova(df, o, g, cfg)
+            if res is None:
+                messages.append(note)
+                continue
+            messages.extend(note)
+            row = {"Outcome": res["label"]}
+            for lv in all_levels:
+                row[lv] = res["cells"].get(lv, "\u2014")
+            row.update({"Test": res["test"]["name"], "Statistic": res["test"]["stat"],
+                        "p-value": fmt_p(res["test"]["p"]), "Effect size": res["test"]["effect"]})
+            s_rows.append(row)
+            a_rows.extend(res["assumptions"])
+            t_rows.extend(res["anova"])
+            for r in res["posthoc"]:
+                p_rows.append({k: r[k] for k in ["Outcome", "Comparison", "Method", "Difference", "CI",
+                                                  "Statistic", "p (raw)", "p (adj.)"]})
+            flags.add("param" if res["use_param"] else "nonparam")
+        if s_rows:
+            ci = f"{100 * (1 - alpha):g}% CI"
+            post_df = pd.DataFrame(p_rows).rename(columns={"CI": ci}) if p_rows else pd.DataFrame()
+            results[g] = {"summary": pd.DataFrame(s_rows), "anova": pd.DataFrame(t_rows),
+                          "assumptions": pd.DataFrame(a_rows), "posthoc": post_df}
+    return results, messages, flags
+
+
+def anova_footnotes(alpha, flags):
+    footnotes = [
+        "Values are mean \u00B1 SD or median (IQR) as indicated in the Outcome column.",
+        f"Bold p-values indicate statistical significance at \u03B1={alpha}.",
+        "Normality assessed per group with Shapiro-Wilk; equal variances with Levene's test (median-centred).",
+        "ANOVA table: SS = sum of squares, MS = mean square. Welch's ANOVA and Kruskal\u2013Wallis do not "
+        "have a standard SS/MS decomposition, so only df, test statistic and p are shown.",
+    ]
+    if "param" in flags:
+        footnotes.append("Parametric: one-way ANOVA (Welch's ANOVA if variances unequal). Post-hoc differences "
+                         "are mean differences (first group \u2212 second group); Tukey/Games-Howell p-values and "
+                         "CIs are familywise-adjusted; Bonferroni CIs use \u03B1/m.")
+    if "nonparam" in flags:
+        footnotes.append("Non-parametric: Kruskal\u2013Wallis H with effect size \u03B5\u00B2=H/(N\u22121). Post hoc: pairwise "
+                         "Mann-Whitney U; difference is the Hodges-Lehmann median difference (first \u2212 second) with a "
+                         "distribution-free CI (widened to \u03B1/m under Holm/Bonferroni).")
+    return footnotes
+
+
+def _df_rows(df):
+    return [list(df.columns)] + df.astype(str).values.tolist()
+
+
+def render_anova_results(res):
+    """Display block for the ANOVA layout: summary, ANOVA table, post hoc and
+    assumption checks per grouping variable, each with copy buttons."""
+    results, messages, flags, cfg = res["anova"]
+    alpha_r = cfg["alpha"]
+    for m in messages:
+        st.warning(m)
+    if not results:
+        return
+    for g, r in results.items():
+        st.markdown(f"### Comparison by **{g}**")
+        st.markdown("#### Summary")
+        h = render_html_anova(r["summary"], alpha_r)
+        st.markdown(h, unsafe_allow_html=True)
+        copy_table_buttons(h, _df_rows(r["summary"]))
+
+        st.markdown("#### ANOVA table")
+        h = render_html_anova(r["anova"], alpha_r)
+        st.markdown(h, unsafe_allow_html=True)
+        copy_table_buttons(h, _df_rows(r["anova"]))
+
+        st.markdown("#### Post-hoc pairwise comparisons")
+        if r["posthoc"].empty:
+            st.caption("No post-hoc table: needs \u22653 groups (with 2 groups the omnibus test is the "
+                       "pairwise test) or the overall test was not significant while that filter is on.")
+        else:
+            h = render_html_anova(r["posthoc"], alpha_r)
+            st.markdown(h, unsafe_allow_html=True)
+            copy_table_buttons(h, _df_rows(r["posthoc"]))
+
+        with st.expander("Assumption checks (normality & equal variances)"):
+            h = render_html_anova(r["assumptions"], alpha_r)
+            st.markdown(h, unsafe_allow_html=True)
+            copy_table_buttons(h, _df_rows(r["assumptions"]))
+
+    footnotes = anova_footnotes(alpha_r, flags)
+    st.caption("  \n".join(footnotes))
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button("Download Excel", build_excel_anova(results), file_name="anova_results.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with d2:
+        st.download_button("Download Word", build_docx_anova(results, alpha_r, footnotes),
+                           file_name="anova_results.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 
 def render_table_markdown(header, display_rows, group_col, alpha):
@@ -1435,12 +1968,13 @@ if uploaded is not None:
 
     layout = st.radio(
         "Table layout",
-        options=["group", "factors", "custom", "paired"],
+        options=["group", "factors", "custom", "paired", "anova"],
         format_func=lambda x: {
             "group": "Standard: categorical grouping variable in columns",
             "factors": "Continuous variable in columns, factors in rows",
             "custom": "Custom table: continuous variable(s) \u00D7 groups (stratified) \u00D7 factor rows",
             "paired": "Paired (pre / post): paired t-test or Wilcoxon signed-rank",
+            "anova": "ANOVA: outcome(s) \u00D7 grouping variable(s), with post hoc",
         }[x],
         horizontal=True,
         help="Standard: pick a categorical grouping variable (e.g. Treatment) and every ticked "
@@ -1452,6 +1986,8 @@ if uploaded is not None:
     factor_mode = layout == "factors"
     custom_mode = layout == "custom"
     paired_mode = layout == "paired"
+    anova_mode = layout == "anova"
+    anova_cfg = {}
     paired_cfg = {}
 
     categorical_cols = [c for c in df.columns if effective_type(var_meta[c]) == "categorical"]
@@ -1600,6 +2136,70 @@ if uploaded is not None:
                 st.warning("Need at least 2 complete pairs to run a paired test.")
                 can_generate = False
             paired_cfg = {"pre": pre_col, "post": post_col, "digits": int(paired_digits)}
+    elif anova_mode:
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            an_outcomes = st.multiselect("Outcome variable(s) (numerical)", options=numerical_cols,
+                                          key="an_outcomes",
+                                          help="Only variables whose Type is numerical are listed.")
+        with ac2:
+            an_groups = st.multiselect("Grouping variable(s) (categorical)", options=categorical_cols,
+                                        key="an_groups",
+                                        help="Each grouping variable gets its own one-way analysis.")
+        ao1, ao2, ao3, ao4 = st.columns([1.6, 1.6, 1.6, 1])
+        with ao1:
+            test_mode = st.radio("Numeric test selection", ["auto", "parametric", "nonparametric"],
+                                  format_func=lambda x: {"auto": "Auto (normality-based)",
+                                                         "parametric": "Force parametric (ANOVA)",
+                                                         "nonparametric": "Force non-parametric (Kruskal\u2013Wallis)"}[x],
+                                  key="an_test_mode")
+            display_mode = st.radio("Descriptive statistics display", ["auto", "mean_sd", "median_iqr", "both"],
+                                     format_func=lambda x: {"auto": "Auto (normality-based)",
+                                                            "mean_sd": "Mean \u00B1 SD",
+                                                            "median_iqr": "Median (IQR)", "both": "Both"}[x],
+                                     key="an_display")
+        with ao2:
+            an_variance = st.selectbox("ANOVA variant (parametric)", ["auto", "classic", "welch"],
+                                        format_func=lambda x: {"auto": "Auto (Levene decides)",
+                                                               "classic": "Classic (equal variances)",
+                                                               "welch": "Welch (unequal variances)"}[x],
+                                        key="an_variance")
+            an_ph_param = st.selectbox("Post hoc \u2014 parametric", ["auto", "tukey", "gameshowell", "bonferroni"],
+                                        format_func=lambda x: {"auto": "Auto (Tukey, or Games-Howell if Welch)",
+                                                               "tukey": "Tukey HSD", "gameshowell": "Games-Howell",
+                                                               "bonferroni": "Bonferroni t-tests"}[x],
+                                        key="an_ph_param")
+        with ao3:
+            an_ph_np = st.selectbox("Post hoc \u2014 non-parametric (Mann-Whitney p adjustment)",
+                                     ["holm", "bonferroni", "bh", "none"],
+                                     format_func=lambda x: {"holm": "Holm", "bonferroni": "Bonferroni",
+                                                            "bh": "Benjamini-Hochberg (FDR)", "none": "None"}[x],
+                                     key="an_ph_np")
+            an_ph_only_sig = st.checkbox("Post hoc only when overall test is significant", value=False,
+                                          key="an_ph_only_sig")
+        with ao4:
+            alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
+                                     value=0.05, step=0.01, key="an_alpha")
+            an_decimals = st.number_input("Decimal places", min_value=0, max_value=6, value=2, step=1,
+                                           key="an_decimals")
+        if not an_outcomes:
+            st.warning("Select at least one outcome variable.")
+            can_generate = False
+        if not an_groups:
+            st.warning("Select at least one grouping variable.")
+            can_generate = False
+        an_overlap = set(an_outcomes) & set(an_groups)
+        if an_overlap:
+            st.error(f"A variable cannot be both outcome and grouping: {', '.join(an_overlap)}")
+            can_generate = False
+        if can_generate:
+            for g in an_groups:
+                lv_counts = df[g].dropna().astype(str).str.strip().value_counts().sort_index()
+                st.info(f"Groups in **{g}**: " + ", ".join(f"{k} (n={v})" for k, v in lv_counts.items()))
+        anova_cfg = {"alpha": alpha, "decimals": int(an_decimals), "test_mode": test_mode,
+                     "display": display_mode, "variance": an_variance, "posthoc_param": an_ph_param,
+                     "posthoc_np": an_ph_np, "posthoc_only_sig": an_ph_only_sig,
+                     "outcomes": an_outcomes, "groups": an_groups}
     else:
         col1, col2, col3, col4 = st.columns([2, 2, 1, 1.3])
         with col1:
@@ -1694,8 +2294,12 @@ if uploaded is not None:
                 else:
                     st.info(f"Groups in **{group_col}**: {counts}")
 
-    if st.button("Generate Table 1", type="primary", disabled=not can_generate):
-        if custom_mode:
+    if st.button("Run ANOVA" if anova_mode else "Generate Table 1", type="primary", disabled=not can_generate):
+        if anova_mode:
+            a_results, a_messages, a_flags = run_anova_analysis(
+                df, anova_cfg["outcomes"], anova_cfg["groups"], anova_cfg)
+            st.session_state["result"] = {"layout": "anova", "anova": (a_results, a_messages, a_flags, anova_cfg)}
+        elif custom_mode:
             cfg = custom_cfg
             hdr, crows, csv_rows, flags = build_custom_table(
                 df, cfg["cont_vars"], cfg["groups"], cfg["levels"], cfg["factors"],
@@ -1754,7 +2358,10 @@ if uploaded is not None:
                 "title": "Table 1. Baseline characteristics", "footnotes": None,
             }
 
-    if "result" in st.session_state:
+    if "result" in st.session_state and st.session_state["result"]["layout"] == "anova":
+        render_anova_results(st.session_state["result"])
+
+    if "result" in st.session_state and st.session_state["result"]["layout"] != "anova":
         res = st.session_state["result"]
         header, display_rows, csv_rows, flags = (res["header"], res["display_rows"],
                                                   res["csv_rows"], res["flags"])
