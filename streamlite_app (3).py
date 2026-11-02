@@ -33,6 +33,12 @@ Two table layouts
    column, factors as rows, and either the column groups or the factor levels
    compared with a test.
 
+4. Paired (pre/post): pick a "pre" and a "post" numeric variable. Pre, post and
+   the difference (post - pre) are summarised on the pairs with both values
+   present, and compared with a paired t-test (parametric) or the Wilcoxon
+   signed-rank test (non-parametric). In "auto" mode normality is assessed on
+   the paired differences, which is the assumption the paired t-test makes.
+
 Parametric vs non-parametric is decided automatically via the
 D'Agostino-Pearson omnibus normality test (scipy.stats.normaltest),
 unless the user forces one or the other.
@@ -497,6 +503,96 @@ def factor_footnotes(display_mode, alpha, outcome_col, flags):
     if "skipped" in flags:
         notes.append("Note: a statistical test could not be computed for one or more factors "
                      "(e.g. insufficient data) and was left blank.")
+    notes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
+    return notes
+
+
+def paired_t_test(a, b):
+    res = stats.ttest_rel(b, a)
+    return {"name": "Paired t-test", "stat": f"t={res.statistic:.2f}, df={len(a)-1}",
+            "p": float(res.pvalue)}
+
+
+def wilcoxon_signed_rank_test(a, b):
+    res = stats.wilcoxon(b, a, alternative="two-sided")
+    return {"name": "Wilcoxon signed-rank test", "stat": f"W={res.statistic:.1f}",
+            "p": float(res.pvalue)}
+
+
+def build_paired_table(df, pre_col, post_col, test_mode, alpha, display_mode="auto", digits=2):
+    """Pre/post layout. Uses only rows where BOTH values are present.
+    Returns (header, display_rows, csv_rows, flags, n_pairs), same shape as the
+    other builders so the existing renderers / exporters can be reused.
+    Test choice: test_mode 'parametric' -> paired t-test, 'nonparametric' ->
+    Wilcoxon signed-rank, 'auto' -> D'Agostino-Pearson normality test on the
+    paired differences. display_mode only controls how summaries are printed."""
+    pre = pd.to_numeric(df[pre_col], errors="coerce")
+    post = pd.to_numeric(df[post_col], errors="coerce")
+    mask = pre.notna() & post.notna()
+    a, b = pre[mask].values.astype(float), post[mask].values.astype(float)
+    diff = b - a
+    n = len(a)
+    flags = set()
+    if (pre.notna() | post.notna()).sum() > n:
+        flags.add("dropped")
+
+    if test_mode == "parametric":
+        use_param = True
+    elif test_mode == "nonparametric":
+        use_param = False
+    else:
+        use_param = is_normal(diff, alpha)
+
+    test_result = None
+    if n >= 2:
+        try:
+            test_result = paired_t_test(a, b) if use_param else wilcoxon_signed_rank_test(a, b)
+            if np.isnan(test_result["p"]):
+                test_result = None
+                flags.add("skipped")
+        except Exception:
+            test_result = None
+            flags.add("skipped")
+    else:
+        flags.add("skipped")
+
+    header = ["Variable", "n (pairs)", f"{pre_col} (pre)", f"{post_col} (post)",
+              "Difference (post \u2212 pre)", "Test", "Statistic", "p"]
+    cells = [str(n)] + [format_numeric_cell(v, display_mode, use_param, digits) for v in (a, b, diff)]
+    label = numeric_label(f"{pre_col} vs {post_col}", display_mode, use_param)
+    display_rows = [{"kind": "var", "label": label, "cells": cells, "test": test_result}]
+    csv_rows = [header, [label, *cells,
+                         test_result["name"] if test_result else "",
+                         test_result["stat"] if test_result else "",
+                         fmt_p(test_result["p"]) if test_result else ""]]
+    return header, display_rows, csv_rows, flags, n
+
+
+def paired_footnotes(display_mode, alpha, pre_col, post_col, test_mode, flags, n_pairs):
+    if display_mode == "mean_sd":
+        desc = "mean \u00B1 SD"
+    elif display_mode == "median_iqr":
+        desc = "median (IQR)"
+    elif display_mode == "both":
+        desc = "mean \u00B1 SD; median (IQR)"
+    else:
+        desc = (f"mean \u00B1 SD (paired differences assessed as normal via D'Agostino-Pearson test, "
+                f"\u03B1={alpha}) or median (IQR) otherwise")
+    notes = [f"Values are {desc}. Difference = {post_col} \u2212 {pre_col}, "
+             f"calculated within each pair; n = {n_pairs} complete pairs."]
+    if test_mode == "parametric":
+        notes.append("Pre and post values were compared with the paired t-test.")
+    elif test_mode == "nonparametric":
+        notes.append("Pre and post values were compared with the Wilcoxon signed-rank test.")
+    else:
+        notes.append("Pre and post values were compared with the paired t-test when the paired "
+                     "differences were normally distributed (D'Agostino-Pearson), otherwise with the "
+                     "Wilcoxon signed-rank test.")
+    if "dropped" in flags:
+        notes.append("Observations missing either the pre or the post value were excluded.")
+    if "skipped" in flags:
+        notes.append("Note: the statistical test could not be computed (e.g. fewer than 2 pairs or no "
+                     "non-zero differences) and was left blank.")
     notes.append(f"Bold p-values indicate statistical significance at \u03B1={alpha}.")
     return notes
 
@@ -1339,11 +1435,12 @@ if uploaded is not None:
 
     layout = st.radio(
         "Table layout",
-        options=["group", "factors", "custom"],
+        options=["group", "factors", "custom", "paired"],
         format_func=lambda x: {
             "group": "Standard: categorical grouping variable in columns",
             "factors": "Continuous variable in columns, factors in rows",
             "custom": "Custom table: continuous variable(s) \u00D7 groups (stratified) \u00D7 factor rows",
+            "paired": "Paired (pre / post): paired t-test or Wilcoxon signed-rank",
         }[x],
         horizontal=True,
         help="Standard: pick a categorical grouping variable (e.g. Treatment) and every ticked "
@@ -1354,6 +1451,8 @@ if uploaded is not None:
     )
     factor_mode = layout == "factors"
     custom_mode = layout == "custom"
+    paired_mode = layout == "paired"
+    paired_cfg = {}
 
     categorical_cols = [c for c in df.columns if effective_type(var_meta[c]) == "categorical"]
     numerical_cols = [c for c in df.columns if effective_type(var_meta[c]) == "numerical"]
@@ -1457,6 +1556,50 @@ if uploaded is not None:
         custom_cfg = {"cont_vars": cont_vars, "groups": custom_groups, "levels": custom_levels,
                       "factors": custom_factors, "digits": int(digits), "compare": compare,
                       "show_n": show_n}
+    elif paired_mode:
+        pc1, pc2, pc3 = st.columns([2, 2, 1])
+        with pc1:
+            pre_col = st.selectbox("Pre variable", options=numerical_cols, key="pre_sel",
+                                    help="Only variables whose Type is numerical are listed.")
+            post_opts = [c for c in numerical_cols if c != pre_col]
+            post_col = st.selectbox("Post variable", options=post_opts, key="post_sel")
+            display_mode = st.radio(
+                "Descriptive statistics display",
+                options=["auto", "mean_sd", "median_iqr", "both"],
+                format_func=lambda x: {"auto": "Auto (normality-based)",
+                                        "mean_sd": "Mean \u00B1 SD",
+                                        "median_iqr": "Median (IQR)",
+                                        "both": "Both"}[x],
+                horizontal=True, key="paired_display",
+            )
+        with pc2:
+            test_mode = st.radio(
+                "Numeric test selection",
+                options=["auto", "parametric", "nonparametric"],
+                format_func=lambda x: {"auto": "Auto (normality-based)",
+                                        "parametric": "Force parametric (paired t-test)",
+                                        "nonparametric": "Force non-parametric (Wilcoxon signed-rank)"}[x],
+                horizontal=True, key="paired_test",
+            )
+            st.caption("In auto mode, normality is checked on the paired differences (post \u2212 pre). "
+                       "Display and test selection are independent.")
+        with pc3:
+            alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
+                                     value=0.05, step=0.01, key="paired_alpha")
+            paired_digits = st.number_input("Decimal places", min_value=0, max_value=6, value=2,
+                                             step=1, key="paired_digits")
+        if len(numerical_cols) < 2 or pre_col is None or post_col is None:
+            st.warning("Need at least two numerical variables. Set **Type** to *numerical* for the "
+                       "pre and post variables in the table above.")
+            can_generate = False
+        else:
+            n_pairs_avail = int((pd.to_numeric(df[pre_col], errors="coerce").notna()
+                                 & pd.to_numeric(df[post_col], errors="coerce").notna()).sum())
+            st.info(f"Pairing **{pre_col}** (pre) \u2192 **{post_col}** (post): {n_pairs_avail} complete pairs.")
+            if n_pairs_avail < 2:
+                st.warning("Need at least 2 complete pairs to run a paired test.")
+                can_generate = False
+            paired_cfg = {"pre": pre_col, "post": post_col, "digits": int(paired_digits)}
     else:
         col1, col2, col3, col4 = st.columns([2, 2, 1, 1.3])
         with col1:
@@ -1572,6 +1715,20 @@ if uploaded is not None:
                 "footnotes": custom_footnotes(cfg["cont_vars"], cfg["groups"], display_mode, test_mode,
                                                alpha, eff_compare, cfg["show_n"], flags),
             }
+        elif paired_mode:
+            header, display_rows, csv_rows, flags, n_pairs = build_paired_table(
+                df, paired_cfg["pre"], paired_cfg["post"], test_mode, alpha, display_mode,
+                digits=paired_cfg["digits"],
+            )
+            st.session_state["result"] = {
+                "layout": "paired", "header": header, "display_rows": display_rows,
+                "csv_rows": csv_rows, "flags": flags, "group_col": "paired",
+                "outcome_col": None, "alpha": alpha, "display_mode": display_mode,
+                "pct_mode": "column", "pct_digits": 2, "yates": False,
+                "title": f"Table 1. Paired comparison: {paired_cfg['pre']} (pre) vs {paired_cfg['post']} (post)",
+                "footnotes": paired_footnotes(display_mode, alpha, paired_cfg["pre"], paired_cfg["post"],
+                                               test_mode, flags, n_pairs),
+            }
         elif factor_mode:
             header, display_rows, csv_rows, flags = build_table_by_factors(
                 df, var_meta, outcome_col, test_mode, alpha, display_mode,
@@ -1613,7 +1770,7 @@ if uploaded is not None:
         st.markdown(table_html, unsafe_allow_html=True)
         copy_table_buttons(table_html, csv_rows)
 
-        if res["layout"] in ("factors", "custom"):
+        if res["layout"] in ("factors", "custom", "paired"):
             footnotes = res["footnotes"]
         else:
             footnotes = [descriptive_footnote(result_display_mode, result_alpha)]
@@ -1660,7 +1817,7 @@ if uploaded is not None:
                 docx_bytes = build_docx(header, display_rows, result_group_col, result_alpha, flags,
                                          result_display_mode, pct_mode=result_pct_mode,
                                          yates_correction=result_yates_correction, title=res["title"],
-                                         footnotes_override=footnotes if res["layout"] == "factors" else None)
+                                         footnotes_override=footnotes if res["layout"] in ("factors", "paired") else None)
             st.download_button("Download Word", docx_bytes, file_name="table1.docx",
                                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
