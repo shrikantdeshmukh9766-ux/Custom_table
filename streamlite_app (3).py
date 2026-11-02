@@ -45,6 +45,11 @@ Two table layouts
    (Tukey HSD / Games-Howell / Bonferroni, or Mann-Whitney with Holm /
    Bonferroni / BH after Kruskal-Wallis).
 
+6. Regression: multiple linear regression (OLS) of one numeric outcome on
+   categorical (dummy-coded against a chosen reference level) and/or numeric
+   predictors. Gives coefficients (estimate, SE, CI, p), the model ANOVA table
+   and R-squared.
+
 Parametric vs non-parametric is decided automatically via the
 D'Agostino-Pearson omnibus normality test (scipy.stats.normaltest),
 unless the user forces one or the other.
@@ -1130,6 +1135,164 @@ def render_anova_results(res):
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
 
+# --------------------------------------------------------------------------
+# Regression layout (multiple linear regression, OLS)
+# --------------------------------------------------------------------------
+
+def run_regression(df, outcome, cat_cols, num_cols, refs, alpha, d):
+    """OLS with an intercept, numeric predictors as-is and categorical predictors
+    dummy-coded against a reference level. Uses complete cases only.
+    Returns (payload, message); payload is None when the model cannot be fitted."""
+    cols = [outcome] + list(cat_cols) + list(num_cols)
+    sub = pd.DataFrame({outcome: pd.to_numeric(df[outcome], errors="coerce")})
+    for c in num_cols:
+        sub[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in cat_cols:
+        v = df[c].astype(str).str.strip()
+        sub[c] = v.where(~v.isin(["", "nan", "NaN", "None"]))
+    n_total = len(sub)
+    sub = sub.dropna()
+    n = len(sub)
+    if n == 0:
+        return None, "No complete cases for the selected variables."
+
+    y = sub[outcome].to_numpy(float)
+    names, columns = ["Intercept"], [np.ones(n)]
+    for c in num_cols:
+        names.append(c)
+        columns.append(sub[c].to_numpy(float))
+    ref_info = []
+    for c in cat_cols:
+        levels = sorted(sub[c].unique())
+        if len(levels) < 2:
+            return None, f"{c} has fewer than 2 levels among the complete cases."
+        ref = refs.get(c) if refs.get(c) in levels else levels[0]
+        ref_info.append((c, ref))
+        for lv in levels:
+            if lv == ref:
+                continue
+            names.append(f"{c}: {lv} (vs {ref})")
+            columns.append((sub[c] == lv).to_numpy(float))
+    X = np.column_stack(columns)
+    p = X.shape[1]
+    if n <= p:
+        return None, f"Need more complete cases than model terms (n={n}, terms={p})."
+    if np.linalg.matrix_rank(X) < p:
+        return None, "Predictors are perfectly collinear (or constant); remove or recode one."
+
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ y
+    resid = y - X @ beta
+    dfr = n - p
+    sse = float(resid @ resid)
+    mse = sse / dfr
+    se = np.sqrt(np.diag(XtX_inv) * mse)
+    t = beta / se
+    pv = 2 * stats.t.sf(np.abs(t), dfr)
+    crit = stats.t.ppf(1 - alpha / 2, dfr)
+    sst = float(((y - y.mean()) ** 2).sum())
+    ssr = sst - sse
+    dfm = p - 1
+    msr = ssr / dfm if dfm > 0 else np.nan
+    F = msr / mse if dfm > 0 and mse > 0 else np.nan
+    pF = float(stats.f.sf(F, dfm, dfr)) if dfm > 0 and not np.isnan(F) else np.nan
+    r2 = ssr / sst if sst > 0 else np.nan
+    adj = 1 - (1 - r2) * (n - 1) / dfr if not np.isnan(r2) else np.nan
+
+    ci_name = f"{100 * (1 - alpha):g}% CI"
+    coef = pd.DataFrame({
+        "Variable": names,
+        "Estimate": [an_fmt_num(b, d) for b in beta],
+        "SE": [an_fmt_num(x, d) for x in se],
+        ci_name: [f"{an_fmt_num(b - crit * x, d)} to {an_fmt_num(b + crit * x, d)}" for b, x in zip(beta, se)],
+        "p-value": [fmt_p(float(x)) for x in pv],
+    })
+    anova = pd.DataFrame([
+        {"Source": "Regression (model)", "SS": an_fmt_num(ssr, d), "df": fmt_df(dfm), "MS": an_fmt_num(msr, d),
+         "F": an_fmt_num(F, d), "p-value": fmt_p(pF)},
+        {"Source": "Residual", "SS": an_fmt_num(sse, d), "df": fmt_df(dfr), "MS": an_fmt_num(mse, d),
+         "F": "\u2014", "p-value": "\u2014"},
+        {"Source": "Total", "SS": an_fmt_num(sst, d), "df": fmt_df(n - 1), "MS": "\u2014",
+         "F": "\u2014", "p-value": "\u2014"},
+    ])
+    summary = pd.DataFrame([{
+        "Outcome": outcome, "n": n, "R\u00B2": an_fmt_num(r2, max(d, 3)),
+        "Adjusted R\u00B2": an_fmt_num(adj, max(d, 3)), "RMSE": an_fmt_num(float(np.sqrt(mse)), d),
+    }])
+    return {"outcome": outcome, "coef": coef, "anova": anova, "summary": summary, "n": n,
+            "excluded": n_total - n, "refs": ref_info, "alpha": alpha,
+            "num_cols": list(num_cols), "cat_cols": list(cat_cols)}, None
+
+
+def regression_footnotes(rg):
+    notes = [f"Multiple linear regression (ordinary least squares) of {rg['outcome']}; n = {rg['n']} complete cases."]
+    if rg["excluded"]:
+        notes.append(f"{rg['excluded']} observation(s) with missing values in the outcome or any predictor were excluded.")
+    notes.append("Estimates are unstandardised coefficients (B) with standard errors (SE); confidence intervals "
+                 "and p-values use the t distribution on the residual degrees of freedom.")
+    if rg["refs"]:
+        notes.append("Categorical predictors are dummy-coded; each coefficient is the difference from the "
+                     "reference level: " + "; ".join(f"{c} (reference: {r})" for c, r in rg["refs"]) + ".")
+    notes.append("ANOVA table tests the overall model (all predictors together) against an intercept-only model.")
+    notes.append(f"Bold p-values indicate statistical significance at \u03B1={rg['alpha']}.")
+    return notes
+
+
+def build_excel_tables(tables):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for name, frame in tables:
+            frame.to_excel(xw, sheet_name=name[:31], index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_docx_tables(title, tables, alpha, footnotes):
+    doc = Document()
+    sec = doc.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = sec.page_height, sec.page_width
+    doc.add_heading(title, level=2)
+    for name, frame in tables:
+        doc.add_paragraph(name).runs[0].bold = True
+        _docx_table(doc, frame, alpha)
+        doc.add_paragraph()
+    for f in footnotes:
+        p = doc.add_paragraph(f)
+        for run in p.runs:
+            run.italic = True
+            run.font.size = Pt(8)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def render_regression_results(res):
+    rg = res["regression"]
+    alpha_r = rg["alpha"]
+    st.markdown(f"### Linear regression: **{rg['outcome']}**")
+    blocks = [("Regression coefficients", rg["coef"]), ("ANOVA table", rg["anova"]),
+              ("Model summary (R\u00B2)", rg["summary"])]
+    for title, frame in blocks:
+        st.markdown(f"#### {title}")
+        h = render_html_anova(frame, alpha_r)
+        st.markdown(h, unsafe_allow_html=True)
+        copy_table_buttons(h, _df_rows(frame))
+    footnotes = regression_footnotes(rg)
+    st.caption("  \n".join(footnotes))
+    tables = [("Coefficients", rg["coef"]), ("ANOVA", rg["anova"]), ("Model summary", rg["summary"])]
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button("Download Excel", build_excel_tables(tables), file_name="regression_results.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with d2:
+        st.download_button("Download Word",
+                           build_docx_tables(f"Linear regression: {rg['outcome']}", blocks, alpha_r, footnotes),
+                           file_name="regression_results.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
 def render_table_markdown(header, display_rows, group_col, alpha):
     """Render the Table 1 as an HTML table with a three-line (journal-style) look."""
     css = """
@@ -1968,13 +2131,14 @@ if uploaded is not None:
 
     layout = st.radio(
         "Table layout",
-        options=["group", "factors", "custom", "paired", "anova"],
+        options=["group", "factors", "custom", "paired", "anova", "regression"],
         format_func=lambda x: {
             "group": "Standard: categorical grouping variable in columns",
             "factors": "Continuous variable in columns, factors in rows",
             "custom": "Custom table: continuous variable(s) \u00D7 groups (stratified) \u00D7 factor rows",
             "paired": "Paired (pre / post): paired t-test or Wilcoxon signed-rank",
             "anova": "ANOVA: outcome(s) \u00D7 grouping variable(s), with post hoc",
+            "regression": "Regression: outcome ~ categorical + numerical predictors (linear)",
         }[x],
         horizontal=True,
         help="Standard: pick a categorical grouping variable (e.g. Treatment) and every ticked "
@@ -1987,6 +2151,8 @@ if uploaded is not None:
     custom_mode = layout == "custom"
     paired_mode = layout == "paired"
     anova_mode = layout == "anova"
+    regression_mode = layout == "regression"
+    regression_cfg = {}
     anova_cfg = {}
     paired_cfg = {}
 
@@ -2200,6 +2366,39 @@ if uploaded is not None:
                      "display": display_mode, "variance": an_variance, "posthoc_param": an_ph_param,
                      "posthoc_np": an_ph_np, "posthoc_only_sig": an_ph_only_sig,
                      "outcomes": an_outcomes, "groups": an_groups}
+    elif regression_mode:
+        rc1, rc2, rc3, rc4 = st.columns([1.4, 1.8, 1.8, 1])
+        with rc1:
+            rg_outcome = st.selectbox("Outcome variable (numerical)", options=numerical_cols, key="rg_outcome",
+                                       help="Only variables whose Type is numerical are listed.")
+        with rc2:
+            rg_cats = st.multiselect("Categorical independent variable(s)", options=categorical_cols,
+                                      key="rg_cats", help="Dummy-coded against a reference level.")
+        with rc3:
+            rg_nums = st.multiselect("Numerical independent variable(s)",
+                                      options=[c for c in numerical_cols if c != rg_outcome], key="rg_nums")
+        with rc4:
+            alpha = st.number_input("Significance level (\u03B1)", min_value=0.001, max_value=0.5,
+                                     value=0.05, step=0.01, key="rg_alpha",
+                                     help="Also sets the confidence level of the CI (1 \u2212 \u03B1).")
+            rg_decimals = st.number_input("Decimal places", min_value=0, max_value=6, value=2, step=1,
+                                           key="rg_decimals")
+        rg_refs = {}
+        if rg_cats:
+            st.caption("Reference level for each categorical variable (coefficients are differences from it):")
+            ref_cols = st.columns(min(len(rg_cats), 4))
+            for i, c in enumerate(rg_cats):
+                lv = sorted(x for x in df[c].dropna().astype(str).str.strip().unique() if x not in ("", "nan"))
+                with ref_cols[i % len(ref_cols)]:
+                    rg_refs[c] = st.selectbox(f"Reference: {c}", options=lv, key=f"rg_ref_{c}") if lv else None
+        if rg_outcome is None:
+            st.warning("Need a numerical outcome variable. Set **Type** to *numerical* in the table above.")
+            can_generate = False
+        if not rg_cats and not rg_nums:
+            st.warning("Select at least one categorical or numerical independent variable.")
+            can_generate = False
+        regression_cfg = {"outcome": rg_outcome, "cats": rg_cats, "nums": rg_nums, "refs": rg_refs,
+                          "alpha": alpha, "decimals": int(rg_decimals)}
     else:
         col1, col2, col3, col4 = st.columns([2, 2, 1, 1.3])
         with col1:
@@ -2294,11 +2493,21 @@ if uploaded is not None:
                 else:
                     st.info(f"Groups in **{group_col}**: {counts}")
 
-    if st.button("Run ANOVA" if anova_mode else "Generate Table 1", type="primary", disabled=not can_generate):
+    if st.button({"anova": "Run ANOVA", "regression": "Run regression"}.get(layout, "Generate Table 1"),
+                 type="primary", disabled=not can_generate):
         if anova_mode:
             a_results, a_messages, a_flags = run_anova_analysis(
                 df, anova_cfg["outcomes"], anova_cfg["groups"], anova_cfg)
             st.session_state["result"] = {"layout": "anova", "anova": (a_results, a_messages, a_flags, anova_cfg)}
+        elif regression_mode:
+            rg_payload, rg_msg = run_regression(
+                df, regression_cfg["outcome"], regression_cfg["cats"], regression_cfg["nums"],
+                regression_cfg["refs"], regression_cfg["alpha"], regression_cfg["decimals"])
+            if rg_payload is None:
+                st.session_state.pop("result", None)
+                st.error(rg_msg)
+            else:
+                st.session_state["result"] = {"layout": "regression", "regression": rg_payload}
         elif custom_mode:
             cfg = custom_cfg
             hdr, crows, csv_rows, flags = build_custom_table(
@@ -2361,7 +2570,10 @@ if uploaded is not None:
     if "result" in st.session_state and st.session_state["result"]["layout"] == "anova":
         render_anova_results(st.session_state["result"])
 
-    if "result" in st.session_state and st.session_state["result"]["layout"] != "anova":
+    if "result" in st.session_state and st.session_state["result"]["layout"] == "regression":
+        render_regression_results(st.session_state["result"])
+
+    if "result" in st.session_state and st.session_state["result"]["layout"] not in ("anova", "regression"):
         res = st.session_state["result"]
         header, display_rows, csv_rows, flags = (res["header"], res["display_rows"],
                                                   res["csv_rows"], res["flags"])
